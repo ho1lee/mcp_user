@@ -1,398 +1,463 @@
+#!/usr/bin/env python3
+"""
+LangGraph Agent with MCP Integration for Business Opportunities
+Implements ReAct (Reasoning and Acting) and CoT (Chain of Thought) patterns
+"""
+
 import asyncio
 import json
 import subprocess
-from typing import Dict, List, Any, Optional, TypedDict
+import sys
+from typing import Any, Dict, List, Optional, TypedDict, Annotated
 from dataclasses import dataclass
 from enum import Enum
 
+# LangGraph imports
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.prebuilt import ToolExecutor
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import Tool
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+import operator
 
+class AgentState(TypedDict):
+    """State for the agent graph"""
+    messages: Annotated[List[BaseMessage], operator.add]
+    current_step: str
+    reasoning_chain: List[str]
+    action_plan: List[str]
+    tool_results: Dict[str, Any]
+    final_answer: Optional[str]
+    iteration_count: int
 
-class AgentMode(Enum):
+class ThinkingType(Enum):
+    """Types of thinking patterns"""
     REACT = "react"
     COT = "cot"
 
-
 @dataclass
-class MCPTool:
-    name: str
-    description: str
-    parameters: Dict[str, Any]
-
-
-class AgentState(TypedDict):
-    messages: List[Any]
-    current_task: str
-    mode: str
-    thoughts: List[str]
-    tools_used: List[str]
-    iteration: int
-    max_iterations: int
-    final_answer: Optional[str]
-
+class MCPResult:
+    """Result from MCP server call"""
+    success: bool
+    data: Any
+    error: Optional[str] = None
 
 class MCPClient:
-    """MCP 서버와 통신하는 클라이언트"""
+    """Client for communicating with MCP server"""
     
-    def __init__(self, server_command: str = "python mcp_server.py"):
-        self.server_command = server_command
-        self.available_tools = []
-    
-    async def get_available_tools(self) -> List[MCPTool]:
-        """사용 가능한 도구 목록 가져오기"""
+    def __init__(self, server_script: str = "mcp_server.py"):
+        self.server_script = server_script
+        
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> MCPResult:
+        """Call a tool on the MCP server"""
         try:
-            # MCP 서버에서 도구 목록 요청
-            result = subprocess.run(
-                [*self.server_command.split(), "--list-tools"], 
-                capture_output=True, 
-                text=True,
-                timeout=10
-            )
-            
-            if result.returncode == 0:
-                tools_data = json.loads(result.stdout)
-                tools = []
-                for tool_data in tools_data.get('tools', []):
-                    tools.append(MCPTool(
-                        name=tool_data['name'],
-                        description=tool_data['description'],
-                        parameters=tool_data.get('parameters', {})
-                    ))
-                self.available_tools = tools
-                return tools
-            else:
-                print(f"도구 목록 가져오기 실패: {result.stderr}")
-                return []
-        except Exception as e:
-            print(f"MCP 서버 통신 오류: {e}")
-            return []
-    
-    async def execute_tool(self, tool_name: str, parameters: Dict[str, Any]) -> str:
-        """도구 실행"""
-        try:
-            # MCP 서버에 도구 실행 요청
-            command_data = {
-                "tool": tool_name,
-                "parameters": parameters
+            # Create the JSON-RPC request
+            request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": arguments
+                }
             }
             
-            result = subprocess.run(
-                [*self.server_command.split(), "--execute", json.dumps(command_data)],
-                capture_output=True,
-                text=True,
-                timeout=30
+            # Start the MCP server process
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, self.server_script,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
             
-            if result.returncode == 0:
-                return result.stdout.strip()
-            else:
-                return f"도구 실행 오류: {result.stderr}"
+            # Send request and get response
+            request_str = json.dumps(request) + "\n"
+            stdout, stderr = await process.communicate(request_str.encode())
+            
+            if process.returncode != 0:
+                error_msg = stderr.decode() if stderr else "Unknown error"
+                return MCPResult(success=False, data=None, error=error_msg)
+            
+            # Parse response
+            response_lines = stdout.decode().strip().split('\n')
+            for line in response_lines:
+                if line.strip():
+                    try:
+                        response = json.loads(line)
+                        if 'result' in response:
+                            return MCPResult(success=True, data=response['result'])
+                        elif 'error' in response:
+                            return MCPResult(success=False, data=None, error=response['error']['message'])
+                    except json.JSONDecodeError:
+                        continue
+            
+            return MCPResult(success=False, data=None, error="No valid response received")
+            
         except Exception as e:
-            return f"도구 실행 중 예외 발생: {e}"
+            return MCPResult(success=False, data=None, error=str(e))
 
-
-class LangGraphMCPAgent:
-    """LangGraph 기반 MCP Agent"""
+class BusinessOpportunityAgent:
+    """LangGraph Agent for Business Opportunity Analysis"""
     
-    def __init__(self, llm_model: str = "gpt-4", max_iterations: int = 10):
-        self.llm = ChatOpenAI(model=llm_model, temperature=0)
+    def __init__(self, openai_api_key: str, thinking_type: ThinkingType = ThinkingType.REACT):
+        self.llm = ChatOpenAI(
+            api_key=openai_api_key,
+            model="gpt-4",
+            temperature=0.1
+        )
         self.mcp_client = MCPClient()
-        self.max_iterations = max_iterations
+        self.thinking_type = thinking_type
+        self.graph = self._create_graph()
         
-        # 프롬프트 템플릿 설정
-        self.react_prompt = ChatPromptTemplate.from_messages([
-            ("system", """당신은 ReAct (Reasoning and Acting) 방식으로 작업하는 AI 에이전트입니다.
-
-사용 가능한 도구들:
-{tools}
-
-다음 형식으로 응답하세요:
-Thought: [현재 상황과 다음 행동에 대한 추론]
-Action: [사용할 도구 이름]
-Action Input: [도구에 전달할 매개변수 (JSON 형식)]
-
-도구 실행 결과를 받은 후:
-Observation: [도구 실행 결과]
-Thought: [결과에 대한 분석과 다음 단계]
-
-최종 답변이 준비되면:
-Final Answer: [최종 답변]
-
-현재 반복: {iteration}/{max_iterations}"""),
-            ("human", "{input}")
-        ])
+    def _create_graph(self) -> StateGraph:
+        """Create the LangGraph workflow"""
+        graph = StateGraph(AgentState)
         
-        self.cot_prompt = ChatPromptTemplate.from_messages([
-            ("system", """당신은 Chain of Thought (CoT) 방식으로 작업하는 AI 에이전트입니다.
-
-사용 가능한 도구들:
-{tools}
-
-단계별로 추론하며 문제를 해결하세요:
-1. 문제 이해 및 분석
-2. 해결 방법 계획
-3. 필요한 도구 사용
-4. 결과 분석 및 검증
-5. 최종 답변 도출
-
-각 단계에서 명확한 추론 과정을 보여주세요.
-도구가 필요한 경우 다음 형식을 사용하세요:
-Tool: [도구 이름]
-Input: [입력값]
-
-현재 반복: {iteration}/{max_iterations}"""),
-            ("human", "{input}")
-        ])
-    
-    async def initialize(self):
-        """에이전트 초기화 - 사용 가능한 도구 로드"""
-        tools = await self.mcp_client.get_available_tools()
-        self.tools_description = self._format_tools_description(tools)
-        print(f"사용 가능한 도구 {len(tools)}개 로드됨")
-    
-    def _format_tools_description(self, tools: List[MCPTool]) -> str:
-        """도구 설명을 포맷팅"""
-        if not tools:
-            return "사용 가능한 도구가 없습니다."
+        # Add nodes
+        graph.add_node("start", self._start_node)
+        graph.add_node("plan", self._planning_node)
+        graph.add_node("reason", self._reasoning_node)
+        graph.add_node("act", self._action_node)
+        graph.add_node("reflect", self._reflection_node)
+        graph.add_node("synthesize", self._synthesis_node)
         
-        descriptions = []
-        for tool in tools:
-            desc = f"- {tool.name}: {tool.description}"
-            if tool.parameters:
-                desc += f" (매개변수: {tool.parameters})"
-            descriptions.append(desc)
-        
-        return "\n".join(descriptions)
-    
-    async def reasoning_node(self, state: AgentState) -> AgentState:
-        """추론 노드 - 현재 상황 분석 및 다음 행동 결정"""
-        current_prompt = self.react_prompt if state["mode"] == "react" else self.cot_prompt
-        
-        # 이전 메시지들을 컨텍스트로 포함
-        context = "\n".join([
-            f"이전 생각: {thought}" for thought in state["thoughts"]
-        ])
-        
-        messages = current_prompt.format_messages(
-            tools=self.tools_description,
-            input=f"{state['current_task']}\n\n컨텍스트:\n{context}",
-            iteration=state["iteration"],
-            max_iterations=state["max_iterations"]
-        )
-        
-        response = await self.llm.ainvoke(messages)
-        
-        # 응답 파싱
-        parsed_response = self._parse_response(response.content, state["mode"])
-        
-        # 상태 업데이트
-        state["thoughts"].append(parsed_response.get("thought", ""))
-        state["messages"].append(AIMessage(content=response.content))
-        
-        return state
-    
-    async def action_node(self, state: AgentState) -> AgentState:
-        """행동 노드 - 도구 실행"""
-        last_message = state["messages"][-1].content
-        action_info = self._extract_action_from_message(last_message)
-        
-        if action_info:
-            tool_name = action_info["tool"]
-            parameters = action_info["parameters"]
-            
-            # 도구 실행
-            result = await self.mcp_client.execute_tool(tool_name, parameters)
-            
-            # 결과를 상태에 추가
-            observation = f"Observation: {result}"
-            state["messages"].append(HumanMessage(content=observation))
-            state["tools_used"].append(f"{tool_name}({parameters})")
-        
-        state["iteration"] += 1
-        return state
-    
-    def _parse_response(self, response: str, mode: str) -> Dict[str, Any]:
-        """응답 파싱"""
-        parsed = {}
-        
-        if mode == "react":
-            # ReAct 형식 파싱
-            lines = response.split('\n')
-            for line in lines:
-                if line.startswith("Thought:"):
-                    parsed["thought"] = line.replace("Thought:", "").strip()
-                elif line.startswith("Action:"):
-                    parsed["action"] = line.replace("Action:", "").strip()
-                elif line.startswith("Action Input:"):
-                    parsed["action_input"] = line.replace("Action Input:", "").strip()
-                elif line.startswith("Final Answer:"):
-                    parsed["final_answer"] = line.replace("Final Answer:", "").strip()
-        else:
-            # CoT 형식 파싱
-            parsed["thought"] = response
-            if "Tool:" in response and "Input:" in response:
-                # 도구 사용 패턴 추출
-                tool_start = response.find("Tool:")
-                input_start = response.find("Input:", tool_start)
-                if tool_start != -1 and input_start != -1:
-                    tool_line = response[tool_start:input_start].replace("Tool:", "").strip()
-                    input_line = response[input_start:].split('\n')[0].replace("Input:", "").strip()
-                    parsed["action"] = tool_line
-                    parsed["action_input"] = input_line
-        
-        return parsed
-    
-    def _extract_action_from_message(self, message: str) -> Optional[Dict[str, Any]]:
-        """메시지에서 행동 정보 추출"""
-        try:
-            if "Action:" in message and "Action Input:" in message:
-                # ReAct 형식
-                action_start = message.find("Action:")
-                input_start = message.find("Action Input:")
-                
-                if action_start != -1 and input_start != -1:
-                    action = message[action_start:input_start].replace("Action:", "").strip()
-                    action_input = message[input_start:].split('\n')[0].replace("Action Input:", "").strip()
-                    
-                    try:
-                        parameters = json.loads(action_input)
-                    except json.JSONDecodeError:
-                        parameters = {"input": action_input}
-                    
-                    return {"tool": action, "parameters": parameters}
-            
-            elif "Tool:" in message and "Input:" in message:
-                # CoT 형식
-                tool_start = message.find("Tool:")
-                input_start = message.find("Input:", tool_start)
-                
-                if tool_start != -1 and input_start != -1:
-                    tool = message[tool_start:input_start].replace("Tool:", "").strip()
-                    tool_input = message[input_start:].split('\n')[0].replace("Input:", "").strip()
-                    
-                    try:
-                        parameters = json.loads(tool_input)
-                    except json.JSONDecodeError:
-                        parameters = {"input": tool_input}
-                    
-                    return {"tool": tool, "parameters": parameters}
-            
-            return None
-        except Exception as e:
-            print(f"행동 추출 오류: {e}")
-            return None
-    
-    def should_continue(self, state: AgentState) -> str:
-        """계속 진행할지 결정"""
-        last_message = state["messages"][-1].content if state["messages"] else ""
-        
-        # 최종 답변이 있거나 최대 반복 횟수에 도달한 경우 종료
-        if ("Final Answer:" in last_message or 
-            state["iteration"] >= state["max_iterations"]):
-            return "end"
-        
-        # 도구 사용이 필요한 경우 action 노드로
-        if ("Action:" in last_message or "Tool:" in last_message):
-            return "action"
-        
-        # 계속 추론
-        return "reasoning"
-    
-    def create_graph(self) -> StateGraph:
-        """LangGraph 생성"""
-        workflow = StateGraph(AgentState)
-        
-        # 노드 추가
-        workflow.add_node("reasoning", self.reasoning_node)
-        workflow.add_node("action", self.action_node)
-        
-        # 엣지 추가
-        workflow.set_entry_point("reasoning")
-        
-        workflow.add_conditional_edges(
-            "reasoning",
-            self.should_continue,
+        # Add edges
+        graph.add_edge("start", "plan")
+        graph.add_edge("plan", "reason")
+        graph.add_edge("reason", "act")
+        graph.add_edge("act", "reflect")
+        graph.add_conditional_edges(
+            "reflect",
+            self._should_continue,
             {
-                "action": "action",
-                "reasoning": "reasoning",
-                "end": END
+                "continue": "reason",
+                "synthesize": "synthesize"
             }
         )
+        graph.add_edge("synthesize", END)
         
-        workflow.add_edge("action", "reasoning")
+        # Set entry point
+        graph.set_entry_point("start")
         
-        return workflow.compile()
+        return graph.compile()
     
-    async def run(self, task: str, mode: AgentMode = AgentMode.REACT) -> Dict[str, Any]:
-        """에이전트 실행"""
-        await self.initialize()
+    async def _start_node(self, state: AgentState) -> Dict[str, Any]:
+        """Initialize the agent state"""
+        return {
+            "current_step": "starting",
+            "reasoning_chain": ["Starting business opportunity analysis..."],
+            "action_plan": [],
+            "tool_results": {},
+            "iteration_count": 0
+        }
+    
+    async def _planning_node(self, state: AgentState) -> Dict[str, Any]:
+        """Plan the approach based on the user query"""
+        user_message = state["messages"][-1].content if state["messages"] else ""
         
-        # 초기 상태 설정
+        planning_prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="""You are a business opportunity analyst. Create a step-by-step plan to answer the user's query.
+            
+Available MCP tools:
+1. get_top_business_opportunity(n) - Get top N opportunities by score
+2. get_salesforce_demand_plan(bo_list) - Convert opportunities to demand plan
+3. get_demand_plan_from_top_opportunities(n) - Combined tool
+
+Create a clear action plan with specific steps."""),
+            HumanMessage(content=f"User query: {user_message}")
+        ])
+        
+        response = await self.llm.ainvoke(planning_prompt.format_messages())
+        
+        # Extract action plan
+        action_plan = [
+            line.strip() for line in response.content.split('\n') 
+            if line.strip() and (line.strip().startswith('-') or line.strip().startswith('1.'))
+        ]
+        
+        return {
+            "current_step": "planned",
+            "action_plan": action_plan,
+            "reasoning_chain": state["reasoning_chain"] + [f"Plan created: {response.content}"]
+        }
+    
+    async def _reasoning_node(self, state: AgentState) -> Dict[str, Any]:
+        """Apply reasoning based on thinking type (ReAct or CoT)"""
+        if self.thinking_type == ThinkingType.REACT:
+            return await self._react_reasoning(state)
+        else:
+            return await self._cot_reasoning(state)
+    
+    async def _react_reasoning(self, state: AgentState) -> Dict[str, Any]:
+        """ReAct: Reasoning and Acting pattern"""
+        user_query = state["messages"][-1].content if state["messages"] else ""
+        current_context = "\n".join(state["reasoning_chain"])
+        
+        react_prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="""You are using ReAct (Reasoning and Acting) approach. 
+            
+For each step:
+1. THOUGHT: Analyze what you need to do next
+2. ACTION: Decide which MCP tool to call and with what parameters
+3. OBSERVATION: You'll receive the results in the next step
+
+Current available actions:
+- get_top_business_opportunity: Get top N opportunities by score
+- get_salesforce_demand_plan: Convert opportunities to demand plan  
+- get_demand_plan_from_top_opportunities: Get top N and create demand plan in one step
+
+Respond with your THOUGHT and ACTION for this iteration."""),
+            HumanMessage(content=f"""
+User Query: {user_query}
+Current Context: {current_context}
+Action Plan: {state['action_plan']}
+Iteration: {state['iteration_count']}
+
+What is your next THOUGHT and ACTION?""")
+        ])
+        
+        response = await self.llm.ainvoke(react_prompt.format_messages())
+        
+        reasoning_step = f"ITERATION {state['iteration_count']} - THOUGHT: {response.content}"
+        
+        return {
+            "current_step": "reasoning_react",
+            "reasoning_chain": state["reasoning_chain"] + [reasoning_step]
+        }
+    
+    async def _cot_reasoning(self, state: AgentState) -> Dict[str, Any]:
+        """CoT: Chain of Thought reasoning"""
+        user_query = state["messages"][-1].content if state["messages"] else ""
+        current_context = "\n".join(state["reasoning_chain"])
+        
+        cot_prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="""You are using Chain of Thought reasoning. Break down the problem step by step.
+
+Think through:
+1. What information do I need?
+2. How can I get this information using available MCP tools?
+3. What analysis should I perform?
+4. How should I present the results?
+
+Available MCP tools:
+- get_top_business_opportunity(n): Get top N opportunities by score
+- get_salesforce_demand_plan(bo_list): Convert opportunities to demand plan
+- get_demand_plan_from_top_opportunities(n): Combined approach
+
+Provide your step-by-step reasoning."""),
+            HumanMessage(content=f"""
+User Query: {user_query}
+Current Context: {current_context}
+Iteration: {state['iteration_count']}
+
+Walk through your reasoning step by step:""")
+        ])
+        
+        response = await self.llm.ainvoke(cot_prompt.format_messages())
+        
+        reasoning_step = f"CoT STEP {state['iteration_count']}: {response.content}"
+        
+        return {
+            "current_step": "reasoning_cot",
+            "reasoning_chain": state["reasoning_chain"] + [reasoning_step]
+        }
+    
+    async def _action_node(self, state: AgentState) -> Dict[str, Any]:
+        """Execute the planned action using MCP tools"""
+        latest_reasoning = state["reasoning_chain"][-1]
+        
+        # Parse the action from reasoning
+        tool_name, tool_args = self._extract_tool_call(latest_reasoning)
+        
+        if tool_name:
+            # Execute MCP tool
+            result = await self.mcp_client.call_tool(tool_name, tool_args)
+            
+            # Store result
+            tool_results = state["tool_results"].copy()
+            tool_results[f"{tool_name}_{state['iteration_count']}"] = result
+            
+            observation = f"OBSERVATION: Tool {tool_name} executed. "
+            if result.success:
+                observation += f"Success. Data received: {json.dumps(result.data, indent=2)[:500]}..."
+            else:
+                observation += f"Error: {result.error}"
+            
+            return {
+                "current_step": "action_executed",
+                "tool_results": tool_results,
+                "reasoning_chain": state["reasoning_chain"] + [observation]
+            }
+        else:
+            return {
+                "current_step": "action_skipped",
+                "reasoning_chain": state["reasoning_chain"] + ["OBSERVATION: No clear action identified"]
+            }
+    
+    async def _reflection_node(self, state: AgentState) -> Dict[str, Any]:
+        """Reflect on the results and decide next steps"""
+        current_context = "\n".join(state["reasoning_chain"][-3:])  # Last 3 steps
+        
+        reflection_prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="""Review the recent actions and results. Decide if you have enough information to provide a complete answer or if you need to continue with more actions.
+
+Respond with either:
+- CONTINUE: if you need more information or actions
+- COMPLETE: if you have sufficient information to provide a final answer
+
+Explain your reasoning."""),
+            HumanMessage(content=f"Recent context:\n{current_context}")
+        ])
+        
+        response = await self.llm.ainvoke(reflection_prompt.format_messages())
+        
+        reflection_step = f"REFLECTION: {response.content}"
+        
+        return {
+            "current_step": "reflected",
+            "reasoning_chain": state["reasoning_chain"] + [reflection_step],
+            "iteration_count": state["iteration_count"] + 1
+        }
+    
+    async def _synthesis_node(self, state: AgentState) -> Dict[str, Any]:
+        """Synthesize final answer from all gathered information"""
+        user_query = state["messages"][-1].content if state["messages"] else ""
+        full_context = "\n".join(state["reasoning_chain"])
+        
+        synthesis_prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="""Synthesize a comprehensive final answer based on all the reasoning and tool results gathered.
+
+Provide:
+1. Direct answer to the user's question
+2. Key insights from the data
+3. Supporting evidence from tool results
+4. Any recommendations or next steps
+
+Make the response clear, actionable, and valuable."""),
+            HumanMessage(content=f"""
+Original User Query: {user_query}
+
+Full Reasoning Chain:
+{full_context}
+
+Tool Results:
+{json.dumps(state['tool_results'], indent=2, default=str)}
+
+Provide your final synthesized answer:""")
+        ])
+        
+        response = await self.llm.ainvoke(synthesis_prompt.format_messages())
+        
+        return {
+            "current_step": "completed",
+            "final_answer": response.content,
+            "reasoning_chain": state["reasoning_chain"] + [f"FINAL SYNTHESIS: {response.content}"]
+        }
+    
+    def _should_continue(self, state: AgentState) -> str:
+        """Decide whether to continue reasoning or synthesize final answer"""
+        latest_reflection = state["reasoning_chain"][-1] if state["reasoning_chain"] else ""
+        
+        # Simple check for completion signals
+        if "COMPLETE" in latest_reflection.upper() or state["iteration_count"] >= 5:
+            return "synthesize"
+        else:
+            return "continue"
+    
+    def _extract_tool_call(self, reasoning_text: str) -> tuple[Optional[str], Dict[str, Any]]:
+        """Extract tool name and arguments from reasoning text"""
+        text_lower = reasoning_text.lower()
+        
+        # Simple pattern matching for tool calls
+        if "get_demand_plan_from_top_opportunities" in text_lower:
+            # Extract n parameter
+            import re
+            n_match = re.search(r'top\s+(\d+)', text_lower)
+            n = int(n_match.group(1)) if n_match else 5
+            return "get_demand_plan_from_top_opportunities", {"n": n}
+        
+        elif "get_top_business_opportunity" in text_lower:
+            import re
+            n_match = re.search(r'top\s+(\d+)', text_lower)
+            n = int(n_match.group(1)) if n_match else 5
+            return "get_top_business_opportunity", {"n": n}
+        
+        elif "get_salesforce_demand_plan" in text_lower:
+            # This would need bo_list from previous results
+            # For now, return None to skip
+            return None, {}
+        
+        return None, {}
+    
+    async def run(self, user_input: str) -> str:
+        """Run the agent with user input"""
         initial_state = AgentState(
-            messages=[],
-            current_task=task,
-            mode=mode.value,
-            thoughts=[],
-            tools_used=[],
-            iteration=0,
-            max_iterations=self.max_iterations,
-            final_answer=None
+            messages=[HumanMessage(content=user_input)],
+            current_step="",
+            reasoning_chain=[],
+            action_plan=[],
+            tool_results={},
+            final_answer=None,
+            iteration_count=0
         )
         
-        # 그래프 생성 및 실행
-        app = self.create_graph()
+        # Execute the graph
+        final_state = await self.graph.ainvoke(initial_state)
         
-        final_state = await app.ainvoke(initial_state)
-        
-        # 결과 정리
-        result = {
-            "task": task,
-            "mode": mode.value,
-            "final_state": final_state,
-            "thoughts": final_state["thoughts"],
-            "tools_used": final_state["tools_used"],
-            "iterations": final_state["iteration"],
-            "messages": final_state["messages"]
-        }
-        
-        return result
+        return final_state.get("final_answer", "Unable to generate final answer")
 
+# Example usage and test functions
+async def test_react_agent():
+    """Test the ReAct agent"""
+    print("=== Testing ReAct Agent ===")
+    
+    # You need to provide your OpenAI API key
+    api_key = "your-openai-api-key-here"  # Replace with actual key
+    
+    agent = BusinessOpportunityAgent(api_key, ThinkingType.REACT)
+    
+    test_queries = [
+        "Get the top 3 business opportunities and create a demand plan",
+        "What are our highest scoring opportunities and their potential impact?",
+        "Generate a production demand plan for our best 5 opportunities"
+    ]
+    
+    for query in test_queries:
+        print(f"\nQuery: {query}")
+        try:
+            result = await agent.run(query)
+            print(f"Result: {result[:500]}...")
+        except Exception as e:
+            print(f"Error: {e}")
 
-# 사용 예제
-async def main():
-    """메인 실행 함수"""
-    # 에이전트 생성
-    agent = LangGraphMCPAgent(max_iterations=5)
+async def test_cot_agent():
+    """Test the Chain of Thought agent"""
+    print("=== Testing CoT Agent ===")
     
-    # ReAct 모드로 실행
-    print("=== ReAct 모드 실행 ===")
-    task1 = "현재 날씨를 확인하고, 그에 따른 옷차림 추천을 해주세요."
-    result1 = await agent.run(task1, AgentMode.REACT)
+    # You need to provide your OpenAI API key
+    api_key = "your-openai-api-key-here"  # Replace with actual key
     
-    print(f"작업: {result1['task']}")
-    print(f"사용된 도구: {', '.join(result1['tools_used'])}")
-    print(f"반복 횟수: {result1['iterations']}")
-    print("\n")
+    agent = BusinessOpportunityAgent(api_key, ThinkingType.COT)
     
-    # CoT 모드로 실행
-    print("=== CoT 모드 실행 ===")
-    task2 = "주어진 데이터를 분석하여 트렌드를 파악하고 예측을 제시해주세요."
-    result2 = await agent.run(task2, AgentMode.COT)
+    query = "Analyze our business opportunities and create a comprehensive demand plan with insights"
+    print(f"\nQuery: {query}")
     
-    print(f"작업: {result2['task']}")
-    print(f"사용된 도구: {', '.join(result2['tools_used'])}")
-    print(f"반복 횟수: {result2['iterations']}")
-
+    try:
+        result = await agent.run(query)
+        print(f"Result: {result}")
+    except Exception as e:
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
-    # 필요한 라이브러리 설치 안내
-    print("필요한 라이브러리:")
-    print("pip install langgraph langchain-openai langchain-core")
-    print("OpenAI API 키를 환경변수 OPENAI_API_KEY에 설정하세요.")
-    print("\n")
+    print("LangGraph MCP Agent for Business Opportunities")
+    print("This agent implements ReAct and Chain of Thought patterns")
+    print("\nTo use this agent:")
+    print("1. Install required packages: pip install langgraph langchain-openai langchain-core")
+    print("2. Set your OpenAI API key in the test functions")
+    print("3. Make sure your mcp_server.py is in the same directory")
+    print("4. Run the test functions")
     
-    # 실행
-    asyncio.run(main())
+    # Uncomment to run tests (after setting API key)
+    # asyncio.run(test_react_agent())
+    # asyncio.run(test_cot_agent())
