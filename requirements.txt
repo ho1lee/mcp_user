@@ -1,0 +1,6 @@
+gradio
+langgraph
+langchain-core # langgraph가 의존할 수 있음
+# langchain # 필요에 따라 langchain의 다른 구성요소 사용 시 추가
+# openai # 실제 OpenAI LLM 사용 시
+# langchain-openai # 실제 OpenAI LLM 사용 시
