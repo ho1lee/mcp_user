@@ -8,6 +8,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import os
 from typing import Any, Dict, List, Optional, TypedDict, Annotated
 from dataclasses import dataclass
 from enum import Enum
@@ -63,24 +64,28 @@ class MCPClient:
                 }
             }
             
-            # Start the MCP server process
+            # Start the MCP server process with UTF-8 environment
+            env = os.environ.copy()
+            env['PYTHONIOENCODING'] = 'utf-8'
+            
             process = await asyncio.create_subprocess_exec(
                 sys.executable, self.server_script,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                env=env
             )
             
             # Send request and get response
-            request_str = json.dumps(request) + "\n"
-            stdout, stderr = await process.communicate(request_str.encode())
+            request_str = json.dumps(request, ensure_ascii=False) + "\n"
+            stdout, stderr = await process.communicate(request_str.encode('utf-8'))
             
             if process.returncode != 0:
-                error_msg = stderr.decode() if stderr else "Unknown error"
+                error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
                 return MCPResult(success=False, data=None, error=error_msg)
             
             # Parse response
-            response_lines = stdout.decode().strip().split('\n')
+            response_lines = stdout.decode('utf-8', errors='ignore').strip().split('\n')
             for line in response_lines:
                 if line.strip():
                     try:
